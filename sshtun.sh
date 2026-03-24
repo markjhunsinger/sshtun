@@ -21,7 +21,7 @@ usage() {
     echo "  -r    Remote host public IP (required for up)"
     echo "  -f    Target file containing IPs/ranges, one per line (required for up/down)"
     echo "  -k    SSH private key path (required for up)"
-    echo "  -t    Tunnel device number, e.g. 0, 1, 2 (required for up/down)"
+    echo "  -t    Tunnel device number, 0–61 (required for up/down)"
     echo "        Each tester must use a unique number"
     echo "  -b    Tunnel IP base (optional, default: 172.16.0)"
     echo "  -h    Show this help message"
@@ -51,10 +51,23 @@ parse_targets() {
 
     while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+        # Validate: must look like an IPv4 address or CIDR notation
+        if ! [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+            echo "WARNING: Skipping invalid entry: $line" >&2
+            continue
+        fi
+
+        # Reject default route
+        if [[ "$line" == "0.0.0.0" || "$line" == "0.0.0.0/0" ]]; then
+            echo "WARNING: Skipping dangerous default route entry: $line" >&2
+            continue
+        fi
+
         if [[ "$line" == *"/"* ]]; then
             ROUTES["$line"]=1
         else
-            OCTETS=$(echo "$line" | cut -d'.' -f1-3)
+            OCTETS="${line%.*}"
             ROUTES["${OCTETS}.0/24"]=1
         fi
     done < "$target_file"
@@ -71,7 +84,13 @@ cmd_setup() {
 
     # Enable tunnel support in SSH
     if ! grep -q "^PermitTunnel yes" /etc/ssh/sshd_config; then
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
         echo "PermitTunnel yes" >> /etc/ssh/sshd_config
+        if ! sshd -t; then
+            echo "ERROR: sshd_config syntax check failed. Restoring backup."
+            cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+            exit 1
+        fi
         systemctl restart sshd
         echo "SSH tunnel support enabled."
     else
@@ -86,11 +105,18 @@ cmd_setup() {
 
     # Get internal-facing interface
     INTERNAL_IF=$(ip route | grep default | awk '{print $5}')
+    if [ -z "$INTERNAL_IF" ]; then
+        echo "ERROR: Could not determine internal-facing interface from default route."
+        exit 1
+    fi
 
-    # Allow forwarding and NAT for the whole tunnel range
-    iptables -A FORWARD -i tun+ -o $INTERNAL_IF -j ACCEPT
-    iptables -A FORWARD -i $INTERNAL_IF -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -t nat -A POSTROUTING -s ${TUNNEL_REMOTE_BASE}.0/24 -o $INTERNAL_IF -j MASQUERADE
+    # Allow forwarding and NAT for the whole tunnel range (idempotent)
+    iptables -C FORWARD -i tun+ -o "$INTERNAL_IF" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i tun+ -o "$INTERNAL_IF" -j ACCEPT
+    iptables -C FORWARD -i "$INTERNAL_IF" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$INTERNAL_IF" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -t nat -C POSTROUTING -s "${TUNNEL_REMOTE_BASE}.0/24" -o "$INTERNAL_IF" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s "${TUNNEL_REMOTE_BASE}.0/24" -o "$INTERNAL_IF" -j MASQUERADE
 
     # Persist iptables rules
     if command -v netfilter-persistent &> /dev/null; then
@@ -149,6 +175,11 @@ cmd_up() {
         usage
     fi
 
+    if ! [[ "$TUN_NUM" =~ ^[0-9]+$ ]] || [ "$TUN_NUM" -lt 0 ] || [ "$TUN_NUM" -gt 61 ]; then
+        echo "ERROR: -t must be an integer between 0 and 61"
+        exit 1
+    fi
+
     if [ ! -f "$TARGET_FILE" ]; then
         echo "Target file not found: $TARGET_FILE"
         exit 1
@@ -159,25 +190,54 @@ cmd_up() {
         exit 1
     fi
 
+    KEY_PERMS=$(stat -c "%a" "$SSH_KEY")
+    if [[ "$KEY_PERMS" != "600" && "$KEY_PERMS" != "400" ]]; then
+        echo "ERROR: SSH key permissions are too open ($KEY_PERMS). Run: chmod 600 \"$SSH_KEY\""
+        exit 1
+    fi
+
     OFFSET=$((TUN_NUM * 4))
     LOCAL_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 1))/30"
     REMOTE_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 2))"
     REMOTE_IP_CIDR="${REMOTE_IP}/30"
+    CTRL_PATH="/tmp/sshtun-ctrl-${TUN_NUM}"
+    STATE_FILE="/tmp/sshtun-state-${TUN_NUM}"
 
     parse_targets "$TARGET_FILE"
 
     # Bring up the tunnel
     echo "Establishing tunnel to $REMOTE_HOST on tun$TUN_NUM..."
     echo "  Local: $LOCAL_IP  Remote: $REMOTE_IP_CIDR"
-    ssh -i "$SSH_KEY" -w "$TUN_NUM:$TUN_NUM" -o Tunnel=point-to-point root@$REMOTE_HOST -N -f
-    sleep 2
+    ssh -i "$SSH_KEY" \
+        -w "$TUN_NUM:$TUN_NUM" \
+        -o Tunnel=point-to-point \
+        -o ControlMaster=yes \
+        -o ControlPath="$CTRL_PATH" \
+        -o ControlPersist=yes \
+        -N \
+        root@"$REMOTE_HOST" &
+
+    # Wait for the tunnel interface to appear (up to 10 seconds)
+    echo "Waiting for tun$TUN_NUM to appear..."
+    for i in $(seq 1 20); do
+        ip link show "tun$TUN_NUM" &>/dev/null && break
+        sleep 0.5
+    done
+    if ! ip link show "tun$TUN_NUM" &>/dev/null; then
+        echo "ERROR: tun$TUN_NUM did not appear after 10 seconds"
+        ssh -o ControlPath="$CTRL_PATH" -O exit root@"$REMOTE_HOST" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Save state for use by cmd_down
+    echo "$REMOTE_HOST" > "$STATE_FILE"
 
     # Configure local side
     ip addr add "$LOCAL_IP" dev "tun$TUN_NUM"
     ip link set "tun$TUN_NUM" up
 
     # Configure remote side
-    ssh -i "$SSH_KEY" root@$REMOTE_HOST \
+    ssh -i "$SSH_KEY" root@"$REMOTE_HOST" \
         "ip addr add $REMOTE_IP_CIDR dev tun$TUN_NUM && ip link set tun$TUN_NUM up"
 
     # Add routes
@@ -206,6 +266,11 @@ cmd_down() {
         usage
     fi
 
+    if ! [[ "$TUN_NUM" =~ ^[0-9]+$ ]] || [ "$TUN_NUM" -lt 0 ] || [ "$TUN_NUM" -gt 61 ]; then
+        echo "ERROR: -t must be an integer between 0 and 61"
+        exit 1
+    fi
+
     if [ ! -f "$TARGET_FILE" ]; then
         echo "Target file not found: $TARGET_FILE"
         exit 1
@@ -213,6 +278,16 @@ cmd_down() {
 
     OFFSET=$((TUN_NUM * 4))
     REMOTE_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 2))"
+    CTRL_PATH="/tmp/sshtun-ctrl-${TUN_NUM}"
+    STATE_FILE="/tmp/sshtun-state-${TUN_NUM}"
+
+    # Read the remote host saved during cmd_up
+    if [ -f "$STATE_FILE" ]; then
+        REMOTE_HOST=$(cat "$STATE_FILE")
+    else
+        echo "WARNING: State file not found at $STATE_FILE; cannot cleanly close SSH connection."
+        REMOTE_HOST=""
+    fi
 
     parse_targets "$TARGET_FILE"
 
@@ -220,9 +295,24 @@ cmd_down() {
         ip route del "$net" via "$REMOTE_IP" 2>/dev/null
     done
 
-    ip link set "tun$TUN_NUM" down
-    ip addr flush dev "tun$TUN_NUM"
-    pkill -f "ssh -w $TUN_NUM:$TUN_NUM"
+    if ip link show "tun$TUN_NUM" &>/dev/null; then
+        ip link set "tun$TUN_NUM" down
+        ip addr flush dev "tun$TUN_NUM"
+    else
+        echo "WARNING: tun$TUN_NUM does not exist, skipping interface teardown."
+    fi
+
+    # Terminate the SSH master connection cleanly
+    if [ -S "$CTRL_PATH" ] && [ -n "$REMOTE_HOST" ]; then
+        ssh -o ControlPath="$CTRL_PATH" -O exit root@"$REMOTE_HOST" 2>/dev/null || true
+        rm -f "$CTRL_PATH"
+    elif [ -S "$CTRL_PATH" ]; then
+        echo "WARNING: Control socket exists but REMOTE_HOST unknown; leaving socket at $CTRL_PATH."
+    else
+        echo "WARNING: No control socket found at $CTRL_PATH; SSH process may have already exited."
+    fi
+
+    rm -f "$STATE_FILE"
 
     echo "Tunnel tun$TUN_NUM torn down."
 }
