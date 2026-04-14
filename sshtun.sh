@@ -1,7 +1,9 @@
 #!/bin/bash
-# sshtun.sh
+set -euo pipefail
 
 TUNNEL_REMOTE_BASE="172.16.0"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+declare -A ROUTES=()
 
 usage() {
     echo "Usage:"
@@ -25,9 +27,9 @@ usage() {
     echo "  -f    Target file containing IPs/ranges, one per line (required for up/down)"
     echo "  -k    Full path to SSH private key (required for up/cleanup)"
     echo "        Must be an absolute path since this script runs with sudo"
-    echo "  -t    Tunnel device number, e.g. 0, 1, 2 (required for up/down/cleanup)"
+    echo "  -t    Tunnel device number 0-62 (required for up/down/cleanup)"
     echo "        Each tester must use a unique number"
-    echo "  -b    Tunnel IP base (optional, default: 172.16.0)"
+    echo "  -b    Tunnel IP base, must be RFC1918 (optional, default: 172.16.0)"
     echo "  -h    Show this help message"
     echo ""
     echo "NOTE: The tunnel base (-b) must not conflict with any IP ranges being"
@@ -57,37 +59,100 @@ usage() {
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "ERROR: This script must be run as root or with sudo."
-        echo "  sudo $0 $@"
+        exit 1
+    fi
+}
+
+validate_tun_num() {
+    local n=$1
+    if [[ ! "$n" =~ ^[0-9]+$ ]] || [ "$n" -gt 62 ]; then
+        echo "ERROR: -t must be an integer between 0 and 62"
+        exit 1
+    fi
+}
+
+validate_remote_host() {
+    local h=$1
+    if [[ ! "$h" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "ERROR: -r must be a valid hostname or IP address"
+        exit 1
+    fi
+}
+
+validate_base() {
+    local b=$1
+    if [[ ! "$b" =~ ^(10\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}|192\.168\.[0-9]{1,3})$ ]]; then
+        echo "ERROR: -b must be a private RFC1918 address base (e.g. 172.16.0, 10.255.0)"
+        exit 1
+    fi
+}
+
+require_file() {
+    local label=$1 path=$2
+    if [ ! -f "$path" ]; then
+        echo "ERROR: $label not found: $path"
+        exit 1
+    fi
+}
+
+check_key_perms() {
+    local key=$1
+    local perms
+    perms=$(stat -c '%a' "$key")
+    if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+        echo "ERROR: SSH key has permissions $perms — must be 600 or 400"
         exit 1
     fi
 }
 
 parse_targets() {
     local target_file=$1
-    declare -gA ROUTES
+    ROUTES=()
 
     while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^# ]] && continue
+        if [[ "$line" == "0.0.0.0/0" || "$line" == "::/0" ]]; then
+            echo "ERROR: Default route $line in target file would override all routing on this host"
+            exit 1
+        fi
         if [[ "$line" == *"/"* ]]; then
+            if [[ ! "$line" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+                echo "ERROR: Invalid CIDR entry in target file: $line"
+                exit 1
+            fi
             ROUTES["$line"]=1
         else
-            OCTETS=$(echo "$line" | cut -d'.' -f1-3)
+            if [[ ! "$line" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+                echo "ERROR: Invalid IP entry in target file: $line"
+                exit 1
+            fi
+            local OCTETS="${line%.*}"
             ROUTES["${OCTETS}.0/24"]=1
         fi
     done < "$target_file"
 }
 
+tunnel_ips() {
+    # Sets LOCAL_IP and REMOTE_IP from TUN_NUM and TUNNEL_REMOTE_BASE.
+    # Caller must declare these as local before calling.
+    local offset=$((TUN_NUM * 4))
+    LOCAL_IP="${TUNNEL_REMOTE_BASE}.$((offset + 1))/30"
+    REMOTE_IP="${TUNNEL_REMOTE_BASE}.$((offset + 2))"
+}
+
 wait_for_device() {
     local device=$1
-    local host=$2
-    local key=$3
+    local host=${2:-}
+    local key=${3:-}
     local timeout=15
     local elapsed=0
 
     echo "Waiting for $device to appear${host:+ on remote host}..."
     while [ $elapsed -lt $timeout ]; do
         if [ -n "$host" ]; then
-            ssh -i "$key" -o ConnectTimeout=5 root@"$host" "ip link show $device" &>/dev/null && return 0
+            # shellcheck disable=SC2086
+            ssh $SSH_OPTS -i "$key" -o ConnectTimeout=5 root@"$host" \
+                "ip link show $device" &>/dev/null && return 0
         else
             ip link show "$device" &>/dev/null && return 0
         fi
@@ -100,6 +165,7 @@ wait_for_device() {
 }
 
 cmd_setup() {
+    local OPTIND=1
     while getopts "b:h" opt; do
         case $opt in
             b) TUNNEL_REMOTE_BASE="$OPTARG" ;;
@@ -108,24 +174,30 @@ cmd_setup() {
         esac
     done
 
-    # Enable tunnel support in SSH
+    validate_base "$TUNNEL_REMOTE_BASE"
+
     if ! grep -q "^PermitTunnel yes" /etc/ssh/sshd_config; then
+        local BACKUP="/etc/ssh/sshd_config.bak.$(date +%s)"
+        cp /etc/ssh/sshd_config "$BACKUP"
         echo "PermitTunnel yes" >> /etc/ssh/sshd_config
+        if ! sshd -t 2>/dev/null; then
+            cp "$BACKUP" /etc/ssh/sshd_config
+            echo "ERROR: sshd config validation failed, reverted. Backup: $BACKUP"
+            exit 1
+        fi
         systemctl restart sshd
         echo "SSH tunnel support enabled."
     else
         echo "SSH tunnel support already enabled."
     fi
 
-    # Enable IP forwarding (persistent)
     if ! grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
         echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
     fi
-    sysctl -w net.ipv4.ip_forward=1
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    # Load tun module
     if ! lsmod | grep -q "^tun "; then
-        modprobe tun
+        modprobe tun 2>/dev/null || true
         echo "TUN module loaded."
     fi
     if ! grep -q "^tun" /etc/modules-load.d/tun.conf 2>/dev/null; then
@@ -133,10 +205,13 @@ cmd_setup() {
         echo "TUN module set to load on boot."
     fi
 
-    # Get internal-facing interface
-    INTERNAL_IF=$(ip route | grep default | awk '{print $5}')
+    local INTERNAL_IF
+    INTERNAL_IF=$(ip route | awk '/^default/{print $5; exit}')
+    if [[ -z "$INTERNAL_IF" || ! "$INTERNAL_IF" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "ERROR: Could not determine internal interface from default route"
+        exit 1
+    fi
 
-    # Allow forwarding and NAT for the whole tunnel range (idempotent)
     iptables -C FORWARD -i tun+ -o "$INTERNAL_IF" -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i tun+ -o "$INTERNAL_IF" -j ACCEPT
     iptables -C FORWARD -i "$INTERNAL_IF" -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
@@ -144,12 +219,11 @@ cmd_setup() {
     iptables -t nat -C POSTROUTING -s "${TUNNEL_REMOTE_BASE}.0/24" -o "$INTERNAL_IF" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s "${TUNNEL_REMOTE_BASE}.0/24" -o "$INTERNAL_IF" -j MASQUERADE
 
-    # Persist iptables rules
-    if command -v netfilter-persistent &> /dev/null; then
+    if command -v netfilter-persistent > /dev/null 2>&1; then
         netfilter-persistent save
         echo "iptables rules saved with netfilter-persistent."
-    elif command -v iptables-save &> /dev/null; then
-        iptables-save > /etc/iptables.rules
+    elif command -v iptables-save > /dev/null 2>&1; then
+        (umask 077; iptables-save > /etc/iptables.rules)
         if [ ! -f /etc/network/if-pre-up.d/iptables ]; then
             cat > /etc/network/if-pre-up.d/iptables << 'EOF'
 #!/bin/bash
@@ -186,6 +260,9 @@ EOF
 }
 
 cmd_up() {
+    local OPTIND=1
+    local REMOTE_HOST="" TARGET_FILE="" SSH_KEY="" TUN_NUM=""
+
     while getopts "r:f:k:t:b:h" opt; do
         case $opt in
             r) REMOTE_HOST="$OPTARG" ;;
@@ -202,52 +279,48 @@ cmd_up() {
         usage
     fi
 
-    if [ ! -f "$TARGET_FILE" ]; then
-        echo "Target file not found: $TARGET_FILE"
-        exit 1
-    fi
+    validate_tun_num "$TUN_NUM"
+    validate_remote_host "$REMOTE_HOST"
+    validate_base "$TUNNEL_REMOTE_BASE"
+    require_file "Target file" "$TARGET_FILE"
+    require_file "SSH key" "$SSH_KEY"
+    check_key_perms "$SSH_KEY"
 
-    if [ ! -f "$SSH_KEY" ]; then
-        echo "SSH key not found: $SSH_KEY"
-        exit 1
-    fi
-
-    OFFSET=$((TUN_NUM * 4))
-    LOCAL_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 1))/30"
-    REMOTE_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 2))"
-    REMOTE_IP_CIDR="${REMOTE_IP}/30"
+    local LOCAL_IP REMOTE_IP
+    tunnel_ips
+    local PID_FILE="/var/run/sshtun-${TUN_NUM}.pid"
+    local SSH_PID
 
     parse_targets "$TARGET_FILE"
 
-    # Bring up the tunnel
     echo "Establishing tunnel to $REMOTE_HOST on tun$TUN_NUM..."
-    echo "  Local: $LOCAL_IP  Remote: $REMOTE_IP_CIDR"
-    ssh -i "$SSH_KEY" -w "$TUN_NUM:$TUN_NUM" -o Tunnel=point-to-point root@$REMOTE_HOST -N -f
-    sleep 2
+    echo "  Local: $LOCAL_IP  Remote: ${REMOTE_IP}/30"
 
-    # Wait for local tun device
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS -i "$SSH_KEY" -w "$TUN_NUM:$TUN_NUM" -o Tunnel=point-to-point \
+        root@"$REMOTE_HOST" -N &
+    SSH_PID=$!
+    echo "$SSH_PID" > "$PID_FILE"
+    disown "$SSH_PID"
+
     if ! wait_for_device "tun$TUN_NUM"; then
-        echo "Failed to establish tunnel. Check SSH connectivity."
+        echo "Failed to establish tunnel. Check SSH connectivity and remote host setup."
         exit 1
     fi
 
-    # Configure local side
     ip addr add "$LOCAL_IP" dev "tun$TUN_NUM"
     ip link set "tun$TUN_NUM" up
 
-    # Wait for remote tun device
     if ! wait_for_device "tun$TUN_NUM" "$REMOTE_HOST" "$SSH_KEY"; then
         echo "Remote tun device not available. Check remote host configuration."
         exit 1
     fi
 
-    # Configure remote side
-    ssh -i "$SSH_KEY" root@$REMOTE_HOST \
-        "ip addr add $REMOTE_IP_CIDR dev tun$TUN_NUM 2>/dev/null; ip link set tun$TUN_NUM up"
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS -i "$SSH_KEY" root@"$REMOTE_HOST" \
+        "ip addr add ${REMOTE_IP}/30 dev tun$TUN_NUM 2>/dev/null; ip link set tun$TUN_NUM up"
 
-    # Verify remote side is configured
     echo "Verifying remote tunnel endpoint..."
-    sleep 1
     if ! ping -c 1 -W 3 "$REMOTE_IP" &>/dev/null; then
         echo "WARNING: Cannot reach remote tunnel endpoint $REMOTE_IP"
         echo "Check remote host configuration."
@@ -255,19 +328,18 @@ cmd_up() {
         echo "Remote tunnel endpoint reachable."
     fi
 
-    # Add routes
     echo "Adding routes:"
     for net in "${!ROUTES[@]}"; do
-        ip route add "$net" via "$REMOTE_IP" dev "tun$TUN_NUM" 2>/dev/null
+        ip route add "$net" via "$REMOTE_IP" dev "tun$TUN_NUM" 2>/dev/null || true
         echo "  $net"
     done
 
-    # Verify routes
     echo ""
     echo "Verifying routes:"
+    local RESULT
     for net in "${!ROUTES[@]}"; do
-        RESULT=$(ip route get "${net%%/*}" 2>/dev/null | head -1)
-        if echo "$RESULT" | grep -q "tun$TUN_NUM"; then
+        RESULT=$(ip route get "${net%%/*}" 2>/dev/null | head -1) || true
+        if echo "$RESULT" | grep -qE "\btun${TUN_NUM}\b"; then
             echo "  $net -> OK"
         else
             echo "  $net -> WARNING: not routing through tun$TUN_NUM"
@@ -280,6 +352,9 @@ cmd_up() {
 }
 
 cmd_down() {
+    local OPTIND=1
+    local TARGET_FILE="" TUN_NUM=""
+
     while getopts "f:t:b:h" opt; do
         case $opt in
             f) TARGET_FILE="$OPTARG" ;;
@@ -294,27 +369,36 @@ cmd_down() {
         usage
     fi
 
-    if [ ! -f "$TARGET_FILE" ]; then
-        echo "Target file not found: $TARGET_FILE"
-        exit 1
-    fi
+    validate_tun_num "$TUN_NUM"
+    validate_base "$TUNNEL_REMOTE_BASE"
+    require_file "Target file" "$TARGET_FILE"
 
-    OFFSET=$((TUN_NUM * 4))
-    REMOTE_IP="${TUNNEL_REMOTE_BASE}.$((OFFSET + 2))"
+    local LOCAL_IP REMOTE_IP
+    tunnel_ips
+    local PID_FILE="/var/run/sshtun-${TUN_NUM}.pid"
 
     parse_targets "$TARGET_FILE"
 
     for net in "${!ROUTES[@]}"; do
-        ip route del "$net" via "$REMOTE_IP" 2>/dev/null
+        ip route del "$net" via "$REMOTE_IP" 2>/dev/null || true
     done
 
-    ip link delete "tun$TUN_NUM" 2>/dev/null
-    pkill -f "ssh -w $TUN_NUM:$TUN_NUM"
+    ip link delete "tun$TUN_NUM" 2>/dev/null || true
+
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    else
+        pkill -f "ssh.*-w ${TUN_NUM}:${TUN_NUM}" 2>/dev/null || true
+    fi
 
     echo "Tunnel tun$TUN_NUM torn down."
 }
 
 cmd_cleanup() {
+    local OPTIND=1
+    local REMOTE_HOST="" SSH_KEY="" TUN_NUM=""
+
     while getopts "r:k:t:h" opt; do
         case $opt in
             r) REMOTE_HOST="$OPTARG" ;;
@@ -329,13 +413,14 @@ cmd_cleanup() {
         usage
     fi
 
-    if [ ! -f "$SSH_KEY" ]; then
-        echo "SSH key not found: $SSH_KEY"
-        exit 1
-    fi
+    validate_tun_num "$TUN_NUM"
+    validate_remote_host "$REMOTE_HOST"
+    require_file "SSH key" "$SSH_KEY"
+    check_key_perms "$SSH_KEY"
 
     echo "Cleaning up remote host $REMOTE_HOST tun$TUN_NUM..."
-    ssh -i "$SSH_KEY" root@$REMOTE_HOST "\
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS -i "$SSH_KEY" root@"$REMOTE_HOST" "\
         ip link delete tun$TUN_NUM 2>/dev/null && \
             echo '  tun$TUN_NUM removed.' || \
             echo '  tun$TUN_NUM not found, nothing to clean up.'"
@@ -344,14 +429,14 @@ cmd_cleanup() {
 }
 
 # Main
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     usage
 fi
 
 COMMAND=$1
 shift
 
-check_root "$COMMAND" "$@"
+check_root
 
 case $COMMAND in
     setup)   cmd_setup "$@" ;;
