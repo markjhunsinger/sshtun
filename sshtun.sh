@@ -4,6 +4,7 @@ set -euo pipefail
 TUNNEL_REMOTE_BASE="172.16.0"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 declare -A ROUTES=()
+declare -a HOSTS=()
 
 usage() {
     echo "Usage:"
@@ -11,10 +12,10 @@ usage() {
     echo "    $0 setup [-b <tunnel_base>]"
     echo ""
     echo "  Bring tunnel up:"
-    echo "    $0 up -r <remote_host> -f <target_file> -k <ssh_key> -t <tun_number> [-b <tunnel_base>]"
+    echo "    $0 up -r <remote_host> -f <target_file> -k <ssh_key> -t <tun_number> [-b <tunnel_base>] [-n <dns_server>]"
     echo ""
     echo "  Tear tunnel down:"
-    echo "    $0 down -f <target_file> -t <tun_number> [-b <tunnel_base>]"
+    echo "    $0 down -t <tun_number>"
     echo ""
     echo "  Clean up remote host:"
     echo "    $0 cleanup -r <remote_host> -k <ssh_key> -t <tun_number>"
@@ -24,13 +25,21 @@ usage() {
     echo ""
     echo "Options:"
     echo "  -r    Remote host public IP (required for up/cleanup)"
-    echo "  -f    Target file containing IPs/ranges, one per line (required for up/down)"
+    echo "  -f    Target file containing IPs, CIDRs, or hostnames, one per line (required for up)"
     echo "  -k    Full path to SSH private key (required for up/cleanup)"
     echo "        Must be an absolute path since this script runs with sudo"
     echo "  -t    Tunnel device number 0-62 (required for up/down/cleanup)"
     echo "        Each tester must use a unique number"
     echo "  -b    Tunnel IP base, must be RFC1918 (optional, default: 172.16.0)"
+    echo "  -n    Internal DNS server IP for resolving hostnames in the target file (optional)"
+    echo "        Required when the target file contains hostnames instead of IPs"
     echo "  -h    Show this help message"
+    echo ""
+    echo "Target file format:"
+    echo "  Each non-blank, non-comment line is one of:"
+    echo "    192.168.1.0/24    CIDR range — routed as-is"
+    echo "    192.168.1.5       Single IP — expanded to its /24"
+    echo "    server.corp.local Hostname — resolved via -n <dns_server> after tunnel is up"
     echo ""
     echo "NOTE: The tunnel base (-b) must not conflict with any IP ranges being"
     echo "scanned. For example, if scanning 172.16.x.x networks, use a different"
@@ -44,14 +53,14 @@ usage() {
     echo "    $0 setup"
     echo "    $0 setup -b 10.255.0"
     echo ""
-    echo "  Tester 1 brings up tunnel and scans:"
+    echo "  Tester 1 brings up tunnel and scans (IPs only):"
     echo "    sudo $0 up -r 203.0.113.50 -f targets.txt -k /home/user/.ssh/client_key -t 0"
-    echo "    sudo $0 down -f targets.txt -t 0"
+    echo "    sudo $0 down -t 0"
     echo "    sudo $0 cleanup -r 203.0.113.50 -k /home/user/.ssh/client_key -t 0"
     echo ""
-    echo "  Tester 2 brings up tunnel with custom base:"
-    echo "    sudo $0 up -r 203.0.113.50 -f targets.txt -k /home/user/.ssh/client_key -t 1 -b 10.255.0"
-    echo "    sudo $0 down -f targets.txt -t 1 -b 10.255.0"
+    echo "  Tester 2 target file contains hostnames — specify internal DNS server:"
+    echo "    sudo $0 up -r 203.0.113.50 -f targets.txt -k /home/user/.ssh/client_key -t 1 -n 10.0.0.53"
+    echo "    sudo $0 down -t 1"
     echo "    sudo $0 cleanup -r 203.0.113.50 -k /home/user/.ssh/client_key -t 1"
     exit 0
 }
@@ -75,6 +84,14 @@ validate_remote_host() {
     local h=$1
     if [[ ! "$h" =~ ^[a-zA-Z0-9._-]+$ ]]; then
         echo "ERROR: -r must be a valid hostname or IP address"
+        exit 1
+    fi
+}
+
+validate_ip() {
+    local ip=$1 label=${2:--n}
+    if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        echo "ERROR: $label must be a valid IP address"
         exit 1
     fi
 }
@@ -108,6 +125,7 @@ check_key_perms() {
 parse_targets() {
     local target_file=$1
     ROUTES=()
+    HOSTS=()
 
     while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^# ]] && continue
@@ -121,15 +139,59 @@ parse_targets() {
                 exit 1
             fi
             ROUTES["$line"]=1
-        else
-            if [[ ! "$line" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-                echo "ERROR: Invalid IP entry in target file: $line"
-                exit 1
-            fi
+        elif [[ "$line" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             local OCTETS="${line%.*}"
             ROUTES["${OCTETS}.0/24"]=1
+        elif [[ "$line" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$ ]]; then
+            HOSTS+=("$line")
+        else
+            echo "ERROR: Invalid entry in target file: $line"
+            exit 1
         fi
     done < "$target_file"
+}
+
+resolve_hosts() {
+    local dns_server=$1 remote_ip=$2 tun_num=$3
+
+    [ ${#HOSTS[@]} -eq 0 ] && return 0
+
+    local resolver
+    if command -v dig > /dev/null 2>&1; then
+        resolver="dig"
+    elif command -v host > /dev/null 2>&1; then
+        resolver="host"
+    else
+        echo "ERROR: Target file contains hostnames but neither 'dig' nor 'host' is installed."
+        echo "  Install dnsutils: apt install dnsutils"
+        exit 1
+    fi
+
+    # Route the DNS server itself through the tunnel first so we can reach it
+    ip route add "${dns_server}/32" via "$remote_ip" dev "tun$tun_num" 2>/dev/null || true
+    echo "  DNS server ${dns_server} routed through tun$tun_num"
+
+    echo "Resolving hostnames via $dns_server:"
+    local host ips ip
+    for host in "${HOSTS[@]}"; do
+        if [ "$resolver" = "dig" ]; then
+            mapfile -t ips < <(dig +short +time=5 +tries=2 "@${dns_server}" "$host" A 2>/dev/null \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        else
+            mapfile -t ips < <(host -W 5 "$host" "$dns_server" 2>/dev/null \
+                | awk '/has address/{print $4}')
+        fi
+
+        if [ ${#ips[@]} -eq 0 ]; then
+            echo "  $host -> ERROR: could not resolve via $dns_server"
+            exit 1
+        fi
+
+        for ip in "${ips[@]}"; do
+            echo "  $host -> $ip"
+            ip route add "${ip}/32" via "$remote_ip" dev "tun$tun_num" 2>/dev/null || true
+        done
+    done
 }
 
 tunnel_ips() {
@@ -253,23 +315,24 @@ EOF
     echo "  with a different base: $0 setup -b <new_base>"
     echo ""
     echo "  On the Nessus host, use the following commands:"
-    echo "    sudo ./sshtun.sh up -r <public_ip_of_this_host> -f <target_file> -k /path/to/ssh_key -t <tun_number> [-b $TUNNEL_REMOTE_BASE]"
-    echo "    sudo ./sshtun.sh down -f <target_file> -t <tun_number> [-b $TUNNEL_REMOTE_BASE]"
+    echo "    sudo ./sshtun.sh up -r <public_ip_of_this_host> -f <target_file> -k /path/to/ssh_key -t <tun_number> [-b $TUNNEL_REMOTE_BASE] [-n <dns_server>]"
+    echo "    sudo ./sshtun.sh down -t <tun_number>"
     echo "    sudo ./sshtun.sh cleanup -r <public_ip_of_this_host> -k /path/to/ssh_key -t <tun_number>"
     echo "============================================"
 }
 
 cmd_up() {
     local OPTIND=1
-    local REMOTE_HOST="" TARGET_FILE="" SSH_KEY="" TUN_NUM=""
+    local REMOTE_HOST="" TARGET_FILE="" SSH_KEY="" TUN_NUM="" DNS_SERVER=""
 
-    while getopts "r:f:k:t:b:h" opt; do
+    while getopts "r:f:k:t:b:n:h" opt; do
         case $opt in
             r) REMOTE_HOST="$OPTARG" ;;
             f) TARGET_FILE="$OPTARG" ;;
             k) SSH_KEY="$OPTARG" ;;
             t) TUN_NUM="$OPTARG" ;;
             b) TUNNEL_REMOTE_BASE="$OPTARG" ;;
+            n) DNS_SERVER="$OPTARG" ;;
             h) usage ;;
             *) usage ;;
         esac
@@ -282,6 +345,7 @@ cmd_up() {
     validate_tun_num "$TUN_NUM"
     validate_remote_host "$REMOTE_HOST"
     validate_base "$TUNNEL_REMOTE_BASE"
+    [ -n "$DNS_SERVER" ] && validate_ip "$DNS_SERVER" "-n"
     require_file "Target file" "$TARGET_FILE"
     require_file "SSH key" "$SSH_KEY"
     check_key_perms "$SSH_KEY"
@@ -292,6 +356,11 @@ cmd_up() {
     local SSH_PID
 
     parse_targets "$TARGET_FILE"
+
+    if [ ${#HOSTS[@]} -gt 0 ] && [ -z "$DNS_SERVER" ]; then
+        echo "ERROR: Target file contains hostnames but no DNS server specified (-n <dns_server_ip>)"
+        exit 1
+    fi
 
     echo "Establishing tunnel to $REMOTE_HOST on tun$TUN_NUM..."
     echo "  Local: $LOCAL_IP  Remote: ${REMOTE_IP}/30"
@@ -334,6 +403,10 @@ cmd_up() {
         echo "  $net"
     done
 
+    if [ -n "$DNS_SERVER" ]; then
+        resolve_hosts "$DNS_SERVER" "$REMOTE_IP" "$TUN_NUM"
+    fi
+
     echo ""
     echo "Verifying routes:"
     local RESULT
@@ -353,35 +426,29 @@ cmd_up() {
 
 cmd_down() {
     local OPTIND=1
-    local TARGET_FILE="" TUN_NUM=""
+    local TUN_NUM=""
 
-    while getopts "f:t:b:h" opt; do
+    while getopts "t:h" opt; do
         case $opt in
-            f) TARGET_FILE="$OPTARG" ;;
             t) TUN_NUM="$OPTARG" ;;
-            b) TUNNEL_REMOTE_BASE="$OPTARG" ;;
             h) usage ;;
             *) usage ;;
         esac
     done
 
-    if [ -z "$TARGET_FILE" ] || [ -z "$TUN_NUM" ]; then
+    if [ -z "$TUN_NUM" ]; then
         usage
     fi
 
     validate_tun_num "$TUN_NUM"
-    validate_base "$TUNNEL_REMOTE_BASE"
-    require_file "Target file" "$TARGET_FILE"
 
-    local LOCAL_IP REMOTE_IP
-    tunnel_ips
     local PID_FILE="/var/run/sshtun-${TUN_NUM}.pid"
 
-    parse_targets "$TARGET_FILE"
-
-    for net in "${!ROUTES[@]}"; do
-        ip route del "$net" via "$REMOTE_IP" 2>/dev/null || true
-    done
+    # Remove all routes through this tunnel device — handles both IP and hostname-resolved routes
+    while IFS= read -r net; do
+        [[ -z "$net" ]] && continue
+        ip route del "$net" dev "tun$TUN_NUM" 2>/dev/null || true
+    done < <(ip route show dev "tun$TUN_NUM" 2>/dev/null | awk '{print $1}')
 
     ip link delete "tun$TUN_NUM" 2>/dev/null || true
 
